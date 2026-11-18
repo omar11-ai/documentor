@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: documentor
+    runtime: python
+    plan: free
+    rootDir: .
+    buildCommand: pip install -e .
+    startCommand: python -m documentor.cli.main serve docs --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
