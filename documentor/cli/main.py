@@ -100,7 +100,11 @@ def analyze(
 
         if output:
             import json
-            output.write_text(json.dumps(result.graph.to_dict(), indent=2))
+            # The output path is often inside a directory that does not exist
+            # yet (e.g. .documentor/graph.json); create it before writing.
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(result.graph.to_dict(), indent=2),
+                              encoding="utf-8")
             console.print(f"\n[green]Knowledge graph saved to {output}[/green]")
 
     except DocumentorError as e:

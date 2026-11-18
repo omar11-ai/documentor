@@ -67,8 +67,22 @@ class LocalModelClient(ModelClient):
         if not self._client:
             return False
         try:
-            models = self._client.list()
-            return any(m["name"].startswith(self._model_name) for m in models.get("models", []))
+            response = self._client.list()
+            # Newer ollama clients return pydantic models, older ones dicts.
+            if isinstance(response, dict):
+                models = response.get("models", [])
+            else:
+                models = getattr(response, "models", []) or []
+            for model in models:
+                if isinstance(model, dict):
+                    name = model.get("name") or model.get("model")
+                else:
+                    # ollama >= 0.5 renamed the field from `name` to `model`.
+                    name = (getattr(model, "name", None)
+                            or getattr(model, "model", None))
+                if name and name.startswith(self._model_name):
+                    return True
+            return False
         except Exception:
             return False
 

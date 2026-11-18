@@ -161,6 +161,7 @@ class DocumentationGenerator:
             fallback_text=fallback_renderer.render_module_doc(
                 module, entities, self._get_source_snippet(module)
             ),
+            allow_llm=self.config.generation.llm_module_docs,
         )
 
     def _generate_entity_doc(self, entity: Entity) -> str:
@@ -226,10 +227,19 @@ class DocumentationGenerator:
             fallback_text=fallback_renderer.render_entity_doc(
                 entity, source_snippet, callers_txt, callees_txt
             ),
+            allow_llm=self.config.generation.llm_entity_docs,
         )
 
-    def _generate_with_fallback(self, prompt: str, system_prompt: str, fallback_text: str) -> str:
+    def _generate_with_fallback(
+        self,
+        prompt: str,
+        system_prompt: str,
+        fallback_text: str,
+        allow_llm: bool = True,
+    ) -> str:
         """Try LLM first, fall back to deterministic template offline."""
+        if not allow_llm:
+            return fallback_text
         try:
             response = self.model_router.generate(prompt, system_prompt)
             return response.content

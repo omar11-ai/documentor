@@ -44,6 +44,18 @@ class GenerationConfig(BaseSettings):
     max_tokens_per_entity: int = 2000
     temperature: float = 0.1
 
+    # Which documents the LLM writes.
+    #
+    # Module docs are architecture overviews - prose is the point, and the
+    # model sees the whole module's entity list, so it stays factual.
+    #
+    # Per-entity docs are API references. Their value is the extracted
+    # signature, role, stability and source, all of which come from the AST
+    # and cannot drift. An LLM retelling the same thing can, so the LLM path
+    # is opt-in for entities.
+    llm_module_docs: bool = True
+    llm_entity_docs: bool = False
+
 
 class NebiusConfig(BaseSettings):
     api_key: Optional[str] = None

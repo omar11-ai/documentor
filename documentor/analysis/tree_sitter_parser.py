@@ -5,7 +5,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 import tree_sitter
-from tree_sitter import Language, Parser
+from tree_sitter import Parser
+
+# Aliased: documentor.core.models also defines a `Language` enum, and that
+# import shadows tree_sitter's Language class further down the import block.
+from tree_sitter import Language as TS_Language
+
+try:  # tree-sitter >= 0.25 moved query compilation onto the Query class
+    from tree_sitter import Query as _TreeSitterQuery
+except ImportError:  # pragma: no cover - older tree-sitter
+    _TreeSitterQuery = None
+
+try:  # tree-sitter >= 0.25 runs queries through a QueryCursor
+    from tree_sitter import QueryCursor as _QueryCursor
+except ImportError:  # pragma: no cover - older tree-sitter
+    _QueryCursor = None
 
 from documentor.analysis.parser_base import BaseParser
 from documentor.core.models import (
@@ -17,6 +31,9 @@ from documentor.core.models import (
     SourceLocation,
 )
 from documentor.utils.hash_utils import generate_entity_id
+from documentor.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 # Language configurations
@@ -34,14 +51,23 @@ QUERIES = {
         "method": "(method_definition name: (property_identifier) @name)",
         "class": "(class_declaration name: (identifier) @name)",
         "variable": "(variable_declarator name: (identifier) @name)",
+        # `const f = () => {}` is how most JavaScript functions are written,
+        # so it has to be captured explicitly or the API reference is empty.
+        "arrow_function": "(variable_declarator name: (identifier) @name "
+                          "value: (arrow_function))",
         "import": "(import_statement) @import",
     },
     Language.TYPESCRIPT: {
         "function": "(function_declaration name: (identifier) @name)",
         "method": "(method_definition name: (property_identifier) @name)",
-        "class": "(class_declaration name: (identifier) @name)",
+        # In tree-sitter-typescript a class name is a type_identifier, not an
+        # identifier - using identifier here makes the whole query invalid.
+        "class": "(class_declaration name: (type_identifier) @name)",
         "interface": "(interface_declaration name: (type_identifier) @name)",
         "type": "(type_alias_declaration name: (type_identifier) @name)",
+        "variable": "(variable_declarator name: (identifier) @name)",
+        "arrow_function": "(variable_declarator name: (identifier) @name "
+                          "value: (arrow_function))",
         "import": "(import_statement) @import",
     },
     Language.GO: {
@@ -53,7 +79,9 @@ QUERIES = {
     },
     Language.RUST: {
         "function": "(function_item name: (identifier) @name)",
-        "method": "(impl_item name: (identifier) @name)",
+        # An impl block has no `name` field - the type it implements is under
+        # `type`, and the trait it implements under `trait`.
+        "method": "(impl_item type: (type_identifier) @name)",
         "struct": "(struct_item name: (type_identifier) @name)",
         "enum": "(enum_item name: (type_identifier) @name)",
         "trait": "(trait_item name: (type_identifier) @name)",
@@ -81,16 +109,46 @@ class TreeSitterParser(BaseParser):
         module_name, attr_name = TREE_SITTER_LANGUAGES[self.language]
         try:
             module = __import__(module_name, fromlist=[attr_name])
-            ts_language = getattr(module, attr_name)
+            raw_language = getattr(module, attr_name)
+            # Newer tree-sitter language packages expose a factory function
+            # returning a PyCapsule; older ones expose the capsule directly.
+            if callable(raw_language):
+                raw_language = raw_language()
+            ts_language = (
+                raw_language
+                if isinstance(raw_language, TS_Language)
+                else TS_Language(raw_language)
+            )
             self._language = ts_language
             self._parser = Parser()
-            self._parser.set_language(ts_language)
 
-            # Compile queries
+            # tree-sitter 0.25+ removed Parser.set_language() in favour of a
+            # plain `language` property. Support both so the package works on
+            # whichever tree-sitter is installed.
+            if hasattr(self._parser, "set_language"):
+                self._parser.set_language(ts_language)
+            else:
+                self._parser.language = ts_language
+
+            # Compile queries. A single bad pattern must not take the whole
+            # language down, so failures are skipped rather than fatal.
             for name, pattern in QUERIES.get(self.language, {}).items():
-                self._queries[name] = ts_language.query(pattern)
+                try:
+                    self._queries[name] = self._compile_query(ts_language, pattern)
+                except Exception as exc:
+                    logger.warning(
+                        f"Skipping invalid {self.language.value} query "
+                        f"'{name}': {exc}"
+                    )
         except ImportError:
             pass  # Language not available
+
+    @staticmethod
+    def _compile_query(ts_language, pattern: str):
+        """Compile a query, supporting both tree-sitter API generations."""
+        if _TreeSitterQuery is not None:
+            return _TreeSitterQuery(ts_language, pattern)
+        return ts_language.query(pattern)
 
     @property
     def supported_extensions(self) -> list[str]:
@@ -124,15 +182,16 @@ class TreeSitterParser(BaseParser):
         imports: list[str] = []
 
         # Get module entity
+        module_name = self._current_file.stem
         module_entity = Entity(
             id=generate_entity_id(
-                qualified_name=file_path.stem,
+                qualified_name=module_name,
                 entity_type=EntityType.MODULE.value,
                 file_path=str(self._current_file),
                 language=self.language.value,
             ),
-            name=file_path.stem,
-            qualified_name=file_path.stem,
+            name=module_name,
+            qualified_name=module_name,
             entity_type=EntityType.MODULE,
             language=self.language,
             location=SourceLocation(
@@ -145,13 +204,13 @@ class TreeSitterParser(BaseParser):
 
         # Extract imports
         if "import" in self._queries:
-            captures = self._queries["import"].captures(root)
+            captures = self._capture(self._queries["import"], root)
             for node, name in captures:
                 imports.append(content[node.start_byte:node.end_byte])
 
         # Extract functions
         if "function" in self._queries:
-            captures = self._queries["function"].captures(root)
+            captures = self._capture(self._queries["function"], root)
             for node, name in captures:
                 if name == "name":
                     func_node = node.parent
@@ -164,6 +223,26 @@ class TreeSitterParser(BaseParser):
                         if entity:
                             entities.append(entity)
 
+        # Extract arrow functions assigned to a variable
+        if "arrow_function" in self._queries:
+            captures = self._capture(self._queries["arrow_function"], root)
+            for node, capture_name in captures:
+                if capture_name != "name":
+                    continue
+                declarator = node.parent
+                if declarator is None or declarator.type != "variable_declarator":
+                    continue
+                value = next((c for c in declarator.children
+                              if c.type == "arrow_function"), None)
+                if value is None:
+                    continue
+                entity = self._create_entity_from_node(
+                    value, content, EntityType.FUNCTION, module_entity.id,
+                    name_node=node,
+                )
+                if entity:
+                    entities.append(entity)
+
         # Extract classes/structs
         for entity_type, query_name in [
             (EntityType.CLASS, "class"),
@@ -172,7 +251,7 @@ class TreeSitterParser(BaseParser):
             (EntityType.TRAIT, "trait"),
         ]:
             if query_name in self._queries:
-                captures = self._queries[query_name].captures(root)
+                captures = self._capture(self._queries[query_name], root)
                 for node, name in captures:
                     if name == "name":
                         type_node = node.parent
@@ -187,20 +266,37 @@ class TreeSitterParser(BaseParser):
 
         return entities
 
+    @staticmethod
+    def _capture(query, root) -> list[tuple]:
+        """Run a query and return [(node, capture_name), ...].
+
+        tree-sitter < 0.25 exposed Query.captures() returning (node, name)
+        tuples. From 0.25 the query must be run through a QueryCursor, which
+        returns a dict of capture name -> list of nodes.
+        """
+        if hasattr(query, "captures"):
+            return list(query.captures(root))
+        if _QueryCursor is None:
+            return []
+        cursor = _QueryCursor(query)
+        captured = cursor.captures(root) or {}
+        return [(node, name) for name, nodes in captured.items() for node in nodes]
+
     def _create_entity_from_node(
         self,
         node: tree_sitter.Node,
         content: str,
         entity_type: EntityType,
         parent_id: str,
+        name_node: Optional[tree_sitter.Node] = None,
     ) -> Optional[Entity]:
         """Create entity from tree-sitter node."""
         # Find name node
-        name_node = None
-        for child in node.children:
-            if child.type in ("identifier", "type_identifier", "property_identifier", "field_identifier"):
-                name_node = child
-                break
+        if name_node is None:
+            for child in node.children:
+                if child.type in ("identifier", "type_identifier", "property_identifier", "field_identifier"):
+                    name_node = child
+                    break
 
         if not name_node:
             return None
@@ -246,7 +342,9 @@ class TreeSitterParser(BaseParser):
             return EntityRole.TEST
         if name_lower.startswith("_"):
             return EntityRole.INTERNAL
-        if entity.entity_type in (EntityType.INTERFACE, EntityType.TRAIT, EntityType.PROTOCOL):
+        # PROTOCOL is an EntityRole, not an EntityType - interfaces and traits
+        # are the entity types that carry the protocol role.
+        if entity.entity_type in (EntityType.INTERFACE, EntityType.TRAIT):
             return EntityRole.PROTOCOL
         if entity.parent_id is None:
             return EntityRole.PUBLIC_API
