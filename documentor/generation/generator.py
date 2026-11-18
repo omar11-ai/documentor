@@ -15,6 +15,7 @@ from documentor.core.models import (
 from documentor.generation.model_client import ModelRouter, ModelResponse
 from documentor.core.exceptions import ModelNotAvailableError
 from documentor.generation import fallback as fallback_renderer
+from documentor.generation import architecture as architecture_renderer
 from documentor.generation.prompts import (
     SYSTEM_PROMPT,
     MODULE_DOC_PROMPT,
@@ -113,6 +114,27 @@ class DocumentationGenerator:
             module_docs=module_docs,
             errors=errors,
             stats=stats,
+        )
+
+    def _generate_architecture_doc(self) -> str:
+        """Generate the repository-level architecture page.
+
+        This is one model call for the whole repository, and it is the page a
+        maintainer reads first, so it is worth the call even when the
+        per-function reference stays on the deterministic template.
+        """
+        context = architecture_renderer.build_architecture_context(
+            self.graph, self.config.project.name
+        )
+        fallback = architecture_renderer.render_architecture_fallback(context)
+        if not self.config.generation.llm_architecture_doc:
+            return fallback
+        prompt = architecture_renderer.build_architecture_prompt(context)
+        return self._generate_with_fallback(
+            prompt,
+            SYSTEM_PROMPT,
+            fallback_text=fallback,
+            max_tokens=self.config.generation.max_tokens_architecture,
         )
 
     def _find_module_entity(self, module_name: str) -> Optional[Entity]:
@@ -236,12 +258,18 @@ class DocumentationGenerator:
         system_prompt: str,
         fallback_text: str,
         allow_llm: bool = True,
+        max_tokens: Optional[int] = None,
     ) -> str:
         """Try LLM first, fall back to deterministic template offline."""
         if not allow_llm:
             return fallback_text
         try:
-            response = self.model_router.generate(prompt, system_prompt)
+            response = self.model_router.generate(
+                prompt,
+                system_prompt,
+                max_tokens=max_tokens or self.config.generation.max_tokens_per_entity,
+                temperature=self.config.generation.temperature,
+            )
             return response.content
         except ModelNotAvailableError:
             logger.info("No LLM available; using offline template fallback")
@@ -286,6 +314,12 @@ class DocumentationGenerator:
         """Write generated documentation to files."""
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Write the repository-level architecture page first: it is the
+        # entry point, and the index links to it.
+        (output_dir / "architecture.md").write_text(
+            self._generate_architecture_doc(), encoding="utf-8"
+        )
+
         # Write module docs
         for module_name, doc in module_docs.items():
             (output_dir / f"{module_name}.md").write_text(doc, encoding="utf-8")
@@ -305,7 +339,11 @@ class DocumentationGenerator:
 
     def _generate_index(self, module_docs: dict[str, str], entity_docs: dict[str, str]) -> str:
         """Generate index page."""
-        lines = ["# Documentation Index\n"]
+        lines = [
+            "# Documentation Index\n",
+            "[Architecture overview](architecture.md) - how this repository is "
+            "laid out, which modules matter, and where it has broken before.\n",
+        ]
 
         for module_name in sorted(module_docs.keys()):
             lines.append(f"## {module_name}")

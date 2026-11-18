@@ -2,7 +2,7 @@
 
 from pathlib import Path
 from typing import Literal, Optional
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -56,6 +56,12 @@ class GenerationConfig(BaseSettings):
     llm_module_docs: bool = True
     llm_entity_docs: bool = False
 
+    # The repository-level architecture page is one model call for the whole
+    # repository and is the page a maintainer reads first, so it is worth the
+    # call even when every other page stays on the deterministic template.
+    llm_architecture_doc: bool = True
+    max_tokens_architecture: int = 1400
+
 
 class NebiusConfig(BaseSettings):
     api_key: Optional[str] = None
@@ -97,6 +103,30 @@ class Config(BaseSettings):
         if isinstance(v, dict):
             return v
         return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fold_flat_model(cls, data):
+        """Accept a top-level `model` block as shorthand for generation.model.
+
+        The model settings belong to generation, but a flat `model:` block is
+        a natural thing to write in a .documentor.yaml. Without this, the
+        extra key was silently discarded (extra="ignore") and the tool quietly
+        used a different model than the file asked for.
+        """
+        if not isinstance(data, dict):
+            return data
+        flat = data.get("model")
+        if not isinstance(flat, dict):
+            return data
+        data = dict(data)
+        generation = dict(data.get("generation") or {})
+        merged = dict(flat)
+        merged.update(generation.get("model") or {})
+        generation["model"] = merged
+        data["generation"] = generation
+        data.pop("model", None)
+        return data
 
     def save(self, path: Path = Path(".documentor.yaml")) -> None:
         """Save configuration to YAML file."""
